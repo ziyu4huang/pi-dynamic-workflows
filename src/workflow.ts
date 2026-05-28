@@ -304,10 +304,6 @@ function createLimiter(limit: number) {
   };
 }
 
-function summarizePrompt(prompt: string): string {
-  return prompt.replace(/\s+/g, " ").trim().slice(0, 60) || "agent";
-}
-
 function defaultAgentLabel(phase: string | undefined, index: number): string {
   return phase ? `${phase} agent ${index}` : `agent ${index}`;
 }

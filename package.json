@@ -1,16 +1,23 @@
 {
   "name": "pi-dynamic-workflows",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Claude-Code-style dynamic workflow orchestration for Pi.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npm run build && npm run smoke:workflow-rpc && npm run smoke:rpc",
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "smoke:rpc": "tsx scripts/rpc-smoke-test.ts",
     "smoke:workflow-rpc": "tsx scripts/workflow-rpc-smoke-test.ts"
   },
-  "keywords": ["pi-package"],
+  "keywords": ["pi-package", "pi", "workflow", "agents"],
   "pi": {
     "extensions": ["extensions/workflow.ts"]
   },

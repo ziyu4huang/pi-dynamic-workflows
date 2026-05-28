@@ -1,39 +1,85 @@
 # pi-dynamic-workflows
 
-Prototype building blocks for Claude-Code-style dynamic workflows on top of Pi.
+Claude-Code-style dynamic workflow orchestration for Pi.
 
-Implemented so far:
+This package adds a `workflow` tool that lets the model run deterministic JavaScript workflows with subagents, phases, parallel fan-out, pipelines, structured results, abort handling, and compact progress rendering in Pi.
 
-- `WorkflowAgent` — spawns an in-memory Pi SDK session as a subagent.
-- `createStructuredOutputTool()` — creates a terminating `structured_output` tool from a TypeBox schema and captures the validated result.
+## Install from disk
 
-## Example
-
-```ts
-import { Type } from "typebox";
-import { WorkflowAgent } from "./src/index.js";
-
-const Result = Type.Object({
-  summary: Type.String(),
-  files: Type.Array(Type.String()),
-});
-
-const agent = new WorkflowAgent({ cwd: process.cwd() });
-
-const result = await agent.run("Inspect this project and summarize it.", {
-  label: "project-summary",
-  schema: Result,
-});
-
-// result is typed as Static<typeof Result>
-console.log(result.summary, result.files);
+```bash
+pi install /Users/michael/projects/pi-dynamic-workflows
 ```
 
-Without `schema`, `agent.run()` returns the last assistant text.
+Then reload Pi:
 
-## Notes
+```text
+/reload
+/workflow-status
+```
 
-- Structured output is implemented as a normal Pi custom tool with `terminate: true`.
-- Pi validates tool arguments against the TypeBox schema before `execute()` runs.
-- The subagent gets an instruction requiring its final action to be `structured_output`.
-- The default subagent tools are Pi's coding tools for the configured `cwd`.
+## Pi extension
+
+The package manifest loads:
+
+```json
+{
+  "pi": {
+    "extensions": ["extensions/workflow.ts"]
+  }
+}
+```
+
+The extension registers and activates the `workflow` tool.
+
+## Workflow script shape
+
+A workflow is raw JavaScript. The first statement must export literal metadata:
+
+```js
+export const meta = {
+  name: 'inspect_project',
+  description: 'Inspect a repository and summarize the main modules',
+  phases: [{ title: 'Scan' }, { title: 'Analyze' }]
+}
+
+phase('Scan')
+const inventory = await agent('Inspect the repository structure.', { label: 'repo inventory' })
+
+phase('Analyze')
+const summary = await agent('Summarize the main modules from this inventory:\n' + inventory, {
+  label: 'module summary'
+})
+
+return { inventory, summary }
+```
+
+Available globals inside the sandbox:
+
+- `agent(prompt, opts)`
+- `parallel(thunks)`
+- `pipeline(items, ...stages)`
+- `phase(title)`
+- `log(message)`
+- `args`
+- `cwd` / `process.cwd()`
+- `budget`
+
+The sandbox intentionally does not expose Node APIs like `fs`, `require`, or imports.
+
+## Library modules
+
+- `src/workflow.ts` — parser and sandboxed workflow runtime.
+- `src/workflow-tool.ts` — Pi tool wrapper, progress updates, rendering, abort normalization.
+- `src/agent.ts` — `WorkflowAgent`, an in-memory Pi subagent runner.
+- `src/structured-output.ts` — terminating structured-output tool backed by TypeBox schemas.
+- `src/display.ts` — workflow snapshots and compact renderers.
+- `extensions/workflow.ts` — production Pi extension entrypoint.
+
+## Development
+
+```bash
+npm install
+npm test
+```
+
+Smoke tests run Pi in RPC mode and verify the workflow and structured-output paths.
