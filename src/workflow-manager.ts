@@ -4,6 +4,7 @@
 
 import { EventEmitter } from "node:events";
 import type { WorkflowAgent } from "./agent.js";
+import { DEFAULT_RUN_STALL_TIMEOUT_MS } from "./config.js";
 import { preview, type WorkflowSnapshot } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
@@ -58,6 +59,13 @@ export interface ExecOptions {
   concurrency?: number;
   /** Retry attempts after recoverable agent failures for this execution. */
   agentRetries?: number;
+  /**
+   * Run-level stall watchdog (ms): abort the run if it makes zero progress (no
+   * agent event, log, phase change, or token usage) for this long. Guarantees a
+   * hung await (dead subagent) releases the lease instead of stranding the run.
+   * null/0 disables. Defaults to the manager's defaultRunStallTimeoutMs.
+   */
+  runStallTimeoutMs?: number | null;
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
   confirm?: (promptText: string, options: unknown) => Promise<unknown>;
 }
@@ -77,6 +85,12 @@ export interface WorkflowManagerOptions {
   defaultAgentTimeoutMs?: number | null;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
+  /**
+   * Default run-level stall watchdog (ms) when a run does not pass runStallTimeoutMs.
+   * Aborts a run that makes zero progress for this long (hung await / dead
+   * subagent), guaranteeing lease release. null/0 disables. See DEFAULT_RUN_STALL_TIMEOUT_MS.
+   */
+  defaultRunStallTimeoutMs?: number | null;
 }
 
 export class WorkflowManager extends EventEmitter {
@@ -92,6 +106,7 @@ export class WorkflowManager extends EventEmitter {
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
   private defaultAgentRetries: number;
+  private defaultRunStallTimeoutMs: number | null;
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -103,6 +118,7 @@ export class WorkflowManager extends EventEmitter {
     this.sessionId = options.sessionId;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
+    this.defaultRunStallTimeoutMs = options.defaultRunStallTimeoutMs ?? DEFAULT_RUN_STALL_TIMEOUT_MS;
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
   }
@@ -273,106 +289,135 @@ export class WorkflowManager extends EventEmitter {
       tokenBudget,
       concurrency,
       agentRetries,
+      runStallTimeoutMs,
       confirm,
     } = exec;
     const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
     const resolvedConcurrency = concurrency ?? this.concurrency;
     const resolvedAgentRetries = agentRetries ?? this.defaultAgentRetries;
-    const progress = () => onProgress?.(managed.snapshot);
+    const resolvedRunStallTimeoutMs =
+      runStallTimeoutMs !== undefined ? runStallTimeoutMs : this.defaultRunStallTimeoutMs;
+    // Stall watchdog (see comment at the Promise.race below). Created here, before
+    // `progress`, so every progress() call resets it — covering all agent/log/phase/
+    // token-usage callbacks without touching each one.
+    const stall = createStallWatchdog(resolvedRunStallTimeoutMs, managed.runId);
+    const progress = () => {
+      stall.reset();
+      onProgress?.(managed.snapshot);
+    };
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
     if (externalSignal) {
       if (externalSignal.aborted) managed.controller.abort();
       else externalSignal.addEventListener("abort", () => managed.controller.abort(), { once: true });
     }
     try {
-      const result = await runWorkflow(script, {
-        cwd: this.cwd,
-        args,
-        agent: this.agent,
-        mainModel: this.mainModel,
-        signal: managed.controller.signal,
-        concurrency: resolvedConcurrency,
-        agentRetries: resolvedAgentRetries,
-        maxAgents,
-        agentTimeoutMs: resolvedAgentTimeoutMs,
-        tokenBudget,
-        confirm,
-        loadSavedWorkflow: this.loadSavedWorkflow,
-        resumeJournal,
-        resumeFromRunId: resumeJournal ? managed.runId : undefined,
-        onAgentJournal: (entry) => {
-          // Append (crash-safe-ish): keep the latest entry per index, then persist.
-          managed.journal = managed.journal.filter((e) => e.index !== entry.index);
-          managed.journal.push(entry);
-          this.persistRun(managed);
-        },
-        onLog: (message) => {
-          managed.snapshot.logs.push(message);
-          this.emit("log", { runId: managed.runId, message });
-          progress();
-        },
-        onPhase: (title) => {
-          managed.snapshot.currentPhase = title;
-          if (!managed.snapshot.phases.includes(title)) {
-            managed.snapshot.phases.push(title);
-          }
-          this.emit("phase", { runId: managed.runId, title });
-          progress();
-        },
-        onAgentStart: (event) => {
-          managed.snapshot.agents.push({
-            id: managed.snapshot.agents.length + 1,
-            label: event.label,
-            phase: event.phase,
-            prompt: event.prompt,
-            status: "running",
-            model: event.model,
-          });
-          this.emit("agentStart", { runId: managed.runId, ...event });
-          progress();
-        },
-        onAgentEnd: (event) => {
-          const agent = [...managed.snapshot.agents]
-            .reverse()
-            .find((a) => a.label === event.label && a.status === "running");
-          if (agent) {
-            agent.status = event.result === null ? "error" : "done";
-            agent.resultPreview = preview(event.result);
-            agent.error = event.error;
-            agent.errorCode = event.errorCode;
-            agent.recoverable = event.recoverable;
-            agent.tokens = event.tokens;
-            if (event.model) agent.model = event.model;
-          }
-          this.emit("agentEnd", { runId: managed.runId, ...event });
-          progress();
-        },
-        onAgentHistory: (event) => {
-          const agent = [...managed.snapshot.agents]
-            .reverse()
-            .find((a) => a.label === event.label && a.status === "running");
-          if (agent) {
-            agent.history = event.history;
-          }
-          this.emit("agentHistory", { runId: managed.runId, ...event });
-          progress();
-        },
-        onTokenUsage: (usage) => {
-          managed.snapshot.tokenUsage = usage;
-          this.emit("tokenUsage", { runId: managed.runId, usage });
-          progress();
-        },
-      });
+      // Stall watchdog: a run that makes zero progress for resolvedRunStallTimeoutMs
+      // is treated as dead (hung await — typically a subagent process that died
+      // without rejecting its promise). Without this, the hung await holds the lease
+      // forever and the run becomes permanently un-resumable. progress() resets it
+      // on every agent start/end, log, phase change, and token usage (see above),
+      // so legitimately long but healthy runs never trip it. On fire it rejects via
+      // Promise.race so executeRun's catch runs normally (status + lease release).
+      stall.arm();
+      try {
+        const result = await Promise.race([
+          runWorkflow(script, {
+            cwd: this.cwd,
+            args,
+            agent: this.agent,
+            mainModel: this.mainModel,
+            signal: managed.controller.signal,
+            concurrency: resolvedConcurrency,
+            agentRetries: resolvedAgentRetries,
+            maxAgents,
+            agentTimeoutMs: resolvedAgentTimeoutMs,
+            tokenBudget,
+            confirm,
+            loadSavedWorkflow: this.loadSavedWorkflow,
+            resumeJournal,
+            resumeFromRunId: resumeJournal ? managed.runId : undefined,
+            onAgentJournal: (entry) => {
+              // Append (crash-safe-ish): keep the latest entry per index, then persist.
+              managed.journal = managed.journal.filter((e) => e.index !== entry.index);
+              managed.journal.push(entry);
+              this.persistRun(managed);
+              stall.reset(); // a journaled result is progress — keep the watchdog alive
+            },
+            onLog: (message) => {
+              managed.snapshot.logs.push(message);
+              this.emit("log", { runId: managed.runId, message });
+              progress();
+            },
+            onPhase: (title) => {
+              managed.snapshot.currentPhase = title;
+              if (!managed.snapshot.phases.includes(title)) {
+                managed.snapshot.phases.push(title);
+              }
+              this.emit("phase", { runId: managed.runId, title });
+              progress();
+            },
+            onAgentStart: (event) => {
+              managed.snapshot.agents.push({
+                id: managed.snapshot.agents.length + 1,
+                label: event.label,
+                phase: event.phase,
+                prompt: event.prompt,
+                status: "running",
+                model: event.model,
+              });
+              this.emit("agentStart", { runId: managed.runId, ...event });
+              progress();
+            },
+            onAgentEnd: (event) => {
+              const agent = [...managed.snapshot.agents]
+                .reverse()
+                .find((a) => a.label === event.label && a.status === "running");
+              if (agent) {
+                agent.status = event.result === null ? "error" : "done";
+                agent.resultPreview = preview(event.result);
+                agent.error = event.error;
+                agent.errorCode = event.errorCode;
+                agent.recoverable = event.recoverable;
+                agent.tokens = event.tokens;
+                if (event.model) agent.model = event.model;
+              }
+              this.emit("agentEnd", { runId: managed.runId, ...event });
+              progress();
+            },
+            onAgentHistory: (event) => {
+              const agent = [...managed.snapshot.agents]
+                .reverse()
+                .find((a) => a.label === event.label && a.status === "running");
+              if (agent) {
+                agent.history = event.history;
+              }
+              this.emit("agentHistory", { runId: managed.runId, ...event });
+              progress();
+            },
+            onTokenUsage: (usage) => {
+              managed.snapshot.tokenUsage = usage;
+              this.emit("tokenUsage", { runId: managed.runId, usage });
+              progress();
+            },
+          }),
+          stall.promise(),
+        ]);
 
-      managed.status = "completed";
-      managed.result = result;
-      this.emit("complete", { runId: managed.runId, result });
+        managed.status = "completed";
+        managed.result = result;
+        this.emit("complete", { runId: managed.runId, result });
 
-      // Persist final state
-      this.persistRun(managed);
-      this.releaseRunLease(managed);
+        // Persist final state
+        this.persistRun(managed);
+        this.releaseRunLease(managed);
 
-      return result;
+        return result;
+      } finally {
+        // Disarm the stall watchdog once the run has settled (success or throw).
+        // If the run threw, the outer catch below handles status + lease; the stall
+        // promise is no longer needed and its timer must not keep firing.
+        stall.disarm();
+      }
     } catch (error) {
       const workflowError =
         error instanceof WorkflowError
@@ -533,6 +578,13 @@ export class WorkflowManager extends EventEmitter {
     };
     this.runs.set(runId, managed);
 
+    // Persist the "running" transition immediately (mirrors startInBackground).
+    // Without this, cached-replay (which journals nothing) leaves the persisted
+    // state frozen at "paused" — so the UI icon never updates and a crash mid-replay
+    // leaves disk/in-memory inconsistent. journal/agents stay as loaded; executeRun
+    // will keep persisting as live agents journal.
+    this.persistRun(managed);
+
     const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
@@ -603,4 +655,79 @@ export class WorkflowManager extends EventEmitter {
   getPersistence(): RunPersistence {
     return this.persistence;
   }
+}
+
+/**
+ * Run-level stall watchdog: a resettable timer whose expiration rejects a promise,
+ * so `executeRun` can `Promise.race` the workflow against it and guarantee it
+ * settles even when a live `agent()` await hangs forever (dead subagent process).
+ *
+ * Lifecycle: create -> arm() -> reset() on every progress event -> on fire,
+ * rejects with a recoverable RUN_STALL WorkflowError -> disarm() in a finally.
+ * reset() is cheap and safe to call before arm() or after disarm() (no-op).
+ * The timer is unref'd so it never keeps the process alive on its own.
+ */
+interface StallWatchdog {
+  arm: () => void;
+  reset: () => void;
+  disarm: () => void;
+  promise: () => Promise<never>;
+}
+
+function createStallWatchdog(timeoutMs: number | null, runId: string): StallWatchdog {
+  // null/0 = disabled. Return a watchdog whose promise never resolves, so
+  // Promise.race reduces to the work promise alone (zero overhead, no timer).
+  if (!timeoutMs || timeoutMs <= 0) {
+    return {
+      arm: () => {},
+      reset: () => {},
+      disarm: () => {},
+      // A promise that never settles; Promise.race ignores it if the work settles.
+      promise: () => new Promise<never>(() => {}),
+    };
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stallPromiseReject: ((err: WorkflowError) => void) | undefined;
+  let stalled = false;
+
+  const clear = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+
+  return {
+    arm() {
+      this.reset();
+    },
+    reset() {
+      if (stalled) return; // already fired; further progress is too late
+      clear();
+      timer = setTimeout(() => {
+        stalled = true;
+        if (stallPromiseReject) {
+          stallPromiseReject(
+            new WorkflowError(
+              `workflow run "${runId}" stalled: no progress for ${timeoutMs}ms (a live agent likely hung — its subagent process may have died without rejecting)`,
+              WorkflowErrorCode.RUN_STALL,
+              { recoverable: true },
+            ),
+          );
+        }
+      }, timeoutMs);
+      timer.unref?.();
+    },
+    disarm() {
+      clear();
+      // Leave stallPromiseReject in place; if already rejected, the race already
+      // settled on it. If not, the never-called resolver just gets GC'd.
+    },
+    promise() {
+      return new Promise<never>((_resolve, reject) => {
+        stallPromiseReject = reject;
+      });
+    },
+  };
 }
