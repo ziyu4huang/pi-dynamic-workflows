@@ -886,6 +886,41 @@ export async function runWorkflow<T = unknown>(
   };
 }
 
+/**
+ * Describes the offending first statement for the "meta must be first" error, so
+ * the message is self-diagnosing instead of a bare "must be the first statement".
+ * Returns a short noun phrase + a quoted source snippet, e.g.
+ *   "a `const` declaration: `const helper = makeHelper()`"
+ *   "an `import` statement (imports are not allowed — workflows must be self-contained): `import fs from 'fs'`"
+ * Comments/blank lines never reach here (acorn excludes them from `body`).
+ */
+function describeLeadingStatement(node: AnyNode | undefined, script: string): string {
+  if (!node) return "an empty script (no statements at all)";
+  const snippet = script.slice(node.start, node.end).replace(/\s+/g, " ").trim();
+  const preview = snippet.length > 80 ? `${snippet.slice(0, 79)}…` : snippet;
+  const quoted = preview ? `: \`${preview}\`` : "";
+  switch (node.type) {
+    case "VariableDeclaration":
+      return `a \`${node.kind}\` declaration${quoted}`;
+    case "ImportDeclaration":
+      return `an \`import\` statement (imports are not allowed — workflows must be self-contained)${quoted}`;
+    case "ExportDefaultDeclaration":
+      return `an \`export default\` statement${quoted}`;
+    case "ExpressionStatement":
+      return `an expression statement${quoted}`;
+    case "FunctionDeclaration":
+      return `a \`function\` declaration${quoted}`;
+    case "ClassDeclaration":
+      return `a \`class\` declaration${quoted}`;
+    case "ReturnStatement":
+      return `a \`return\` statement${quoted}`;
+    case "IfStatement":
+      return `an \`if\` statement${quoted}`;
+    default:
+      return `a \`${node.type}\` statement${quoted}`;
+  }
+}
+
 export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body: string } {
   if (DETERMINISM_BLOCKLIST.test(script)) {
     throw new WorkflowError(
@@ -906,7 +941,14 @@ export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body:
   const first = ast.body?.[0] as AnyNode | undefined;
   if (first?.type !== "ExportNamedDeclaration") {
     throw new WorkflowError(
-      "`export const meta = { name, description, phases }` must be the first statement in the script",
+      [
+        "`export const meta = { name, description, phases }` must be the first statement in the script,",
+        `but the script starts with ${describeLeadingStatement(first, script)}.`,
+        "Move any code below the `export const meta` line.",
+        "Note: leading `//` line comments, `/* block */` comments, blank lines, and a leading BOM are NOT",
+        "statements and never trigger this error — only real code (a declaration, import, expression, etc.)",
+        "before the meta export does.",
+      ].join(" "),
       WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
       { recoverable: false },
     );

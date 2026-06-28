@@ -35,6 +35,31 @@ test("parseWorkflowScript requires meta export first", () => {
   );
 });
 
+test("parseWorkflowScript 'meta must be first' error names the offending statement", () => {
+  // The error is self-diagnosing: it quotes the actual first statement so the
+  // author (or LLM) can fix it without guessing.
+  assert.throws(
+    () => parseWorkflowScript("const helper = makeHelper()\nexport const meta = { name: 'demo', description: 'desc' }"),
+    /starts with a `const` declaration: `const helper = makeHelper\(\)`/,
+  );
+  assert.throws(
+    () => parseWorkflowScript("import fs from 'fs'\nexport const meta = { name: 'demo', description: 'desc' }"),
+    /starts with an `import` statement.*imports are not allowed/,
+  );
+  // Empty / whitespace-only scripts report "no statements at all".
+  assert.throws(() => parseWorkflowScript(""), /no statements at all/);
+});
+
+test("parseWorkflowScript tolerates leading comments and blanks before meta", () => {
+  // Comments and blank lines are NOT statements, so they must never trigger the
+  // "meta must be first" error — only real code before the export does.
+  const leading = ["// line comment\n", "/* block */\n", "/** doc */\n", "\n\n"];
+  for (const prefix of leading) {
+    const parsed = parseWorkflowScript(`${prefix}export const meta = { name: 'demo', description: 'desc' }\nreturn 1`);
+    assert.equal(parsed.meta.name, "demo");
+  }
+});
+
 test("parseWorkflowScript requires name and description", () => {
   assert.throws(() => parseWorkflowScript("export const meta = { name: 'demo' }"), /meta.description/);
   assert.throws(() => parseWorkflowScript("export const meta = { description: 'desc' }"), /meta.name/);
