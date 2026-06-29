@@ -5,6 +5,14 @@
 export enum WorkflowErrorCode {
   /** Agent exceeded timeout. */
   AGENT_TIMEOUT = "AGENT_TIMEOUT",
+  /**
+   * Run-level stall watchdog fired: the run made no progress (no agent event, log,
+   * phase change, or token usage) for the configured stall window. Indicates a hung
+   * await — typically a subagent process that died without rejecting its promise —
+   * which would otherwise hold the lease forever. Recoverable: the journal prefix
+   * is intact and resume() can replay it.
+   */
+  RUN_STALL = "RUN_STALL",
   /** Workflow was aborted by user. */
   WORKFLOW_ABORTED = "WORKFLOW_ABORTED",
   /** Agent limit exceeded. */

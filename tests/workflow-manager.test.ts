@@ -1847,3 +1847,86 @@ return results`;
     assert.equal(result.agentCount, 0, "no agents should run with empty parallel");
   }),
 );
+
+// --- Stall watchdog (orphan-lease prevention) ---
+// Reproduces the production failure: a live agent() whose subagent process died
+// without rejecting (so the await hangs forever). Without the watchdog this holds
+// the lease indefinitely and the run becomes un-resumable. The stall watchdog
+// must fire, release the lease, and leave the run resumable.
+
+test(
+  "stall watchdog fires when an agent never settles, releasing the lease and leaving the run resumable",
+  withTempCwd(async (cwd) => {
+    // Agent whose run() promise NEVER resolves (simulates a dead subagent).
+    const hung = {
+      async run(_prompt: string) {
+        return new Promise(() => {}); // hangs forever
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent: hung });
+    manager.on("error", () => {}); // swallow the emitted error for the test
+    const pers = manager.getPersistence();
+
+    // Drive a real run via runSync with a short stall window. runSync mints its own
+    // runId; we just need it to stall and release the lease.
+    const runPromise = manager.runSync(oneAgentScript, undefined, {
+      runStallTimeoutMs: 60,
+    });
+
+    let thrown: unknown;
+    try {
+      await runPromise;
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown instanceof WorkflowError, "stall should reject with WorkflowError");
+    assert.equal((thrown as WorkflowError).code, WorkflowErrorCode.RUN_STALL, "error code is RUN_STALL");
+    assert.equal((thrown as WorkflowError).recoverable, true, "stall is recoverable so resume can replay");
+
+    // The lease MUST have been released: a fresh acquire must succeed now.
+    const reacquired = pers.acquireRunLease("stall-lease-check-after-stall");
+    assert.ok(reacquired, "stall released the run's lease (a fresh lease is acquirable)");
+    if (reacquired) pers.releaseRunLease(reacquired);
+  }),
+);
+
+test(
+  "stall watchdog does not false-trip a healthy run that completes within the window",
+  withTempCwd(async (cwd) => {
+    // A healthy agent that settles quickly. Stall window is generous; must NOT abort.
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          return "healthy";
+        },
+      },
+    });
+    const result = await manager.runSync(oneAgentScript, undefined, {
+      runStallTimeoutMs: 10_000, // generous; run finishes in ms
+    });
+    assert.deepEqual((result.result as { a: unknown }).a, "healthy");
+  }),
+);
+
+test(
+  "stall watchdog disabled (null) preserves unbounded behavior — a slow agent is not aborted by the stall layer",
+  withTempCwd(async (cwd) => {
+    // Agent that takes 120ms but emits no progress meanwhile. With stall DISABLED
+    // (null) it must complete; the stall layer must not interfere.
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt: string) {
+          await new Promise((r) => setTimeout(r, 120));
+          return "slow-but-fine";
+        },
+      },
+    });
+    const result = await manager.runSync(oneAgentScript, undefined, {
+      runStallTimeoutMs: null,
+    });
+    assert.deepEqual((result.result as { a: unknown }).a, "slow-but-fine");
+  }),
+);
